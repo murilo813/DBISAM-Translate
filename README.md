@@ -1,3 +1,6 @@
+[![License: MIT](https://img.shields. diplomat/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-v1.70%2B-orange.svg)](https://www.rust-lang.org/)
+
 # 🛠️ DBISAM-Translate
 
 Conjunto de ferramentas em Rust de alta performance para engenharia reversa e extração de dados de arquivos binários **DBISAM (.dat)**. 
