@@ -1,4 +1,6 @@
-[![License: MIT](https://img.shields. diplomat/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+## Licença
+
+Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](./LICENSE) para detalhes.
 [![Rust](https://img.shields.io/badge/rust-v1.70%2B-orange.svg)](https://www.rust-lang.org/)
 
 # 🛠️ DBISAM-Translate
