@@ -1,7 +1,3 @@
-## Licença
-
-Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](./LICENSE) para detalhes.
-
 # 🛠️ DBISAM-Translate
 
 Conjunto de ferramentas em Rust de alta performance para engenharia reversa e extração de dados de arquivos binários **DBISAM (.dat)**. 
@@ -77,5 +73,10 @@ O schema.toml será usado aqui, o coloque na pasta raíz do seu DBISAM-Loader.ex
 TARGET_TABLE=NomeDaTabela (sem o .dat)
 DB_PATH=C:\caminho\para\os\arquivos_dat
 ```
+---
+
+## Licença
+
+Este projeto está licenciado sob Licença - veja o arquivo [LICENSE](./LICENSE) para detalhes.
 
 Desenvolvido com ❤️ por Murilo de Souza
