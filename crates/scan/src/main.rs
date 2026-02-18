@@ -77,7 +77,7 @@ fn analyze_dat_file(path: &Path) -> std::io::Result<TableConfig> {
                 let name = String::from_utf8_lossy(name_bytes).to_string();
                 let type_id = block[0xA4];
 
-                let offset = u16::from_le_bytes(block[0xAC..0xAE].try_into().unwrap()) as u32;
+                let offset = (u16::from_le_bytes(block[0xAC..0xAE].try_into().unwrap()) as u32) + 1;
 
                 let type_desc = match type_id {
                     1 => "S",
@@ -87,7 +87,7 @@ fn analyze_dat_file(path: &Path) -> std::io::Result<TableConfig> {
                     _ => "B",
                 };
 
-                if type_id != 0 && offset > 0 {
+                if type_id != 0 && offset > 1 {
                     columns.push(Column {
                         name,
                         field_type: type_desc.to_string(),
