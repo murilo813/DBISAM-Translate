@@ -2,7 +2,7 @@ use memmap2::Mmap;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::env;
 
 #[derive(Deserialize, Debug)]
@@ -10,6 +10,7 @@ struct Column {
     name: String,
     field_type: String,
     offset: u32,
+    length: u32, 
 }
 
 #[derive(Deserialize, Debug)]
@@ -21,12 +22,29 @@ struct TableConfig {
 type SchemaConfig = BTreeMap<String, TableConfig>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(dir) = exe_path.parent() {
+            let env_path = dir.join(".env");
+            dotenvy::from_path(&env_path).ok();
+        }
+    }
+
     dotenvy::dotenv().ok();
 
     let target_table = env::var("TARGET_TABLE")
-        .expect("ERRO: TARGET_TABLE não definida no .env");
+        .map(|v| v.replace('"', ""))
+        .unwrap_or_else(|_| {
+            println!("⚠️ TARGET_TABLE não encontrada no .env, usando padrão: Pessoas");
+            "Pessoas".to_string()
+        });
+
     let base_path = env::var("DB_PATH")
-        .expect("ERRO: DB_PATH não definida no .env");
+        .map(|v| v.replace('"', ""))
+        .unwrap_or_else(|_| {
+            let path = r"C:\BmSoft\Bases\zecao".to_string();
+            println!("⚠️ DB_PATH não encontrado no .env, usando padrão: {}", path);
+            path
+        });
     
     let toml_content = std::fs::read_to_string("schema.toml")
         .expect("ERRO: schema.toml não encontrado na raiz");
@@ -59,34 +77,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut count = 0;
     let mut i = data_offset;
+    let cols_len = config.columns.len();
 
     while i + row_size <= mmap.len() {
-        let row_data = &mmap[i..i + row_size];
+        if let Some(row_data) = mmap.get(i..i + row_size) {
+            if row_data[0] == 0 {
+                let mut row_values = Vec::with_capacity(cols_len);
 
-        if row_data[0] == 0 {
-            let mut row_values = Vec::new();
-
-            for col in &config.columns {
-                let start = col.offset as usize;
-                
-                let val = match col.field_type.as_str() {
-                    "S" => {
-                        decode_windows1252(&row_data[start..])
-                    },
-                    "I" => {
-                        let bytes: [u8; 4] = row_data[start..start+4].try_into().unwrap_or([0; 4]);
-                        i32::from_le_bytes(bytes).to_string()
-                    },
-                    "F" | "D" => {
-                        let bytes: [u8; 8] = row_data[start..start+8].try_into().unwrap_or([0; 8]);
-                        format!("{:.4}", f64::from_le_bytes(bytes))
-                    },
-                    _ => "".to_string(),
-                };
-                row_values.push(val);
+                for col in &config.columns {
+                    let start = col.offset as usize + 1;
+                    
+                    let val = match col.field_type.as_str() {
+                        "S" => {
+                            let end = start + col.length as usize;
+                            if let Some(slice) = row_data.get(start..end) {
+                                decode_windows1252(slice)
+                            } else {
+                                String::new()
+                            }
+                        },
+                        "I" => {
+                            if let Some(slice) = row_data.get(start..start+4) {
+                                let bytes: [u8; 4] = slice.try_into().unwrap_or([0; 4]);
+                                i32::from_le_bytes(bytes).to_string()
+                            } else {
+                                String::new()
+                            }
+                        },
+                        "F" => {
+                            if let Some(slice) = row_data.get(start..start+8) {
+                                let bytes: [u8; 8] = slice.try_into().unwrap_or([0; 8]);
+                                format!("{:.4}", f64::from_le_bytes(bytes))
+                            } else {
+                                String::new()
+                            }
+                        },
+                        "D" => {
+                            if let Some(slice) = row_data.get(start..start+4) {
+                                let bytes: [u8; 4] = slice.try_into().unwrap_or([0; 4]);
+                                let days = i32::from_le_bytes(bytes);
+                                if days > 0 { convert_dbisam_to_iso(days) } else { "".to_string() }
+                            } else {
+                                String::new()
+                            }
+                        },
+                        "B" => {
+                            "[BIN]".to_string() 
+                        },
+                        _ => "".to_string(),
+                    };
+                    row_values.push(val);
+                }
+                wtr.write_record(&row_values)?;
+                count += 1;
             }
-            wtr.write_record(&row_values)?;
-            count += 1;
         }
 
         i += row_size;
@@ -100,5 +144,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn decode_windows1252(bytes: &[u8]) -> String {
     let (res, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
-    res.split('\0').next().unwrap_or("").trim().to_string()
+    res.trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_string()
+}
+
+fn convert_dbisam_to_iso(days: i32) -> String {
+    let epoch_days = days - 719163;
+    let seconds = (epoch_days as i64) * 86400;
+    if let Some(t) = std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds.max(0) as u64)) {
+        let datetime: chrono::DateTime<chrono::Utc> = t.into();
+        return datetime.format("%Y-%m-%d").to_string();
+    }
+    "".to_string()
 }
