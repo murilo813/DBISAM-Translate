@@ -75,6 +75,11 @@ DB_PATH=C:\caminho\para\os\arquivos_dat
 ```
 ---
 
+[!IMPORTANT]
+**Aviso sobre Tipagem Dinâmica (Booleanos/Inteiros):**
+O DBISAM é traiçoeiro com campos lógicos e inteiros. O scanner calcula o tamanho (1 byte ou 4 bytes) baseando-se no **espaço real(gap)** entre as colunas do arquivo binário. Isso evita "lixo de memória" e garante que o motor leia exatamente o que está no disco, mesmo qe o cabeçalho original seja inconscitente.
+Sobre os booleanos, no dbisam eles são 0 e 1, por isso são mapeados como "I".
+
 ## Licença
 
 Este projeto está licenciado sob Licença - veja o arquivo [LICENSE](./LICENSE) para detalhes.
