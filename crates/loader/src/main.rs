@@ -86,45 +86,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 for col in &config.columns {
                     let start = col.offset as usize + 1;
+                    let end = (start + col.length as usize).min(row_size); 
                     
                     let val = match col.field_type.as_str() {
                         "S" => {
-                            let end = start + col.length as usize;
                             if let Some(slice) = row_data.get(start..end) {
                                 decode_windows1252(slice)
-                            } else {
-                                String::new()
-                            }
+                            } else { String::new() }
                         },
                         "I" => {
-                            if let Some(slice) = row_data.get(start..start+4) {
-                                let bytes: [u8; 4] = slice.try_into().unwrap_or([0; 4]);
-                                i32::from_le_bytes(bytes).to_string()
-                            } else {
-                                String::new()
-                            }
+                            if let Some(slice) = row_data.get(start..end) {
+                                let mut b = [0u8; 4];
+                                let n = slice.len().min(4);
+                                b[..n].copy_from_slice(&slice[..n]);
+                                i32::from_le_bytes(b).to_string()
+                            } else { "0".to_string() }
                         },
                         "F" => {
-                            if let Some(slice) = row_data.get(start..start+8) {
-                                let bytes: [u8; 8] = slice.try_into().unwrap_or([0; 8]);
-                                format!("{:.4}", f64::from_le_bytes(bytes))
-                            } else {
-                                String::new()
-                            }
+                            if let Some(slice) = row_data.get(start..end) {
+                                let mut b = [0u8; 8];
+                                let n = slice.len().min(8);
+                                b[..n].copy_from_slice(&slice[..n]);
+                                format!("{:.4}", f64::from_le_bytes(b))
+                            } else { "0.0000".to_string() }
                         },
                         "D" => {
-                            if let Some(slice) = row_data.get(start..start+4) {
-                                let bytes: [u8; 4] = slice.try_into().unwrap_or([0; 4]);
-                                let days = i32::from_le_bytes(bytes);
-                                if days > 0 { convert_dbisam_to_iso(days) } else { "".to_string() }
-                            } else {
-                                String::new()
-                            }
+                            if let Some(slice) = row_data.get(start..end) {
+                                let mut b = [0u8; 4];
+                                let n = slice.len().min(4);
+                                b[..n].copy_from_slice(&slice[..n]);
+                                let days = i32::from_le_bytes(b);
+                                if days > 0 { convert_dbisam_to_iso(days) } else { String::new() }
+                            } else { String::new() }
                         },
-                        "B" => {
-                            "[BIN]".to_string() 
-                        },
-                        _ => "".to_string(),
+                        "B" => "[BIN]".to_string(),
+                        _ => String::new(),
                     };
                     row_values.push(val);
                 }
