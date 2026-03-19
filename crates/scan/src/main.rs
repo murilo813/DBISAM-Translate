@@ -160,7 +160,15 @@ fn analyze_dat_file(path: &Path) -> std::io::Result<TableConfig> {
                 _ => 1,
             };
         }
-        final_columns.push(col);
+
+        let max_available = record_size as i32 - (col.offset as i32 + 1);
+        if (col.length as i32) > max_available {
+            let new_len = if max_available > 0 { max_available as u32 } else { 0 };
+            col.length = new_len;
+        }
+        if col.length > 0 {
+            final_columns.push(col);
+        }
     }
 
     Ok(TableConfig {
