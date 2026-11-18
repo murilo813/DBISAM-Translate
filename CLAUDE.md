@@ -20,6 +20,8 @@ Leitura de tabelas DBISAM 4 (`.dat` + `.blb`) direto do arquivo, sem driver. Wor
 
 Refeito em nov/2026. Validado em 9 tabelas reais (3,3 milhões de registros; memos de 6 tabelas, 5,1 milhões, conferidos pelo id do cabeçalho): igual a um decodificador independente escrito à parte, em todas as linhas e memos, e o faturamento de um mês bateu ao centavo com um BI que lê a mesma base por outro caminho. 9 tabelas (5,7 GB) em ~5 s com os arquivos em cache.
 
+Em produção (18/11/2026): usado pelo Alembro Integrador (outro repositório), que replica 119 tabelas do BM para o PostgreSQL: carga inicial de 21,9 milhões de linhas em 4 min; ciclo incremental de ~72 s a cada 15 min, lendo a pasta de bases do BM com ele aberto, sem erro de leitura nem de hash. Os dados reais conferiram com o BI e as ligações entre tabelas bateram (99 a 100%), inclusive os memos (corrigidos no commit `555999f`).
+
 ## Armadilhas já encontradas (não repetir)
 
 - **Nunca confiar num `schema.toml` antigo para ler dados:** a estrutura muda com as versões do sistema (coluna nova, campo 1 byte maior) e a leitura sai desalinhada sem erro. O loader antigo fazia isso. Sempre ler os descritores do `.dat`.

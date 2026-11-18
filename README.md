@@ -101,6 +101,9 @@ Memos de texto são lidos do `.blb` que estiver ao lado do `.dat` (mesmo nome). 
 ### Validação
 Comparado registro a registro com um decodificador independente (todas as linhas de 9 tabelas e os 5,1 milhões de memos de 6 tabelas, achados só pelo id do cabeçalho do `.blb`, sem diferença) e com o BI que lê a mesma base por outro caminho (faturamento de um mês por loja igual ao centavo).
 
+### Em uso
+O crate `dbisam` é a base do Alembro Integrador (replicação incremental do BM para PostgreSQL usando RecordID + RecordHash como chave de mudança). Em produção, 119 tabelas (21,9 milhões de linhas) carregam em ~4 min e o ciclo incremental leva ~70 s lendo a pasta do BM em uso.
+
 ## Licença
 
 Este projeto está licenciado sob Licença - veja o arquivo [LICENSE](./LICENSE) para detalhes.
