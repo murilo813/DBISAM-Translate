@@ -34,9 +34,13 @@ Tipos 5 (SmallInt), 8 (BCD), 9 (Bytes), 12 (Word), 13 (LargeInt) e 14 (AutoInc) 
 ### Memos (arquivo `.blb`)
 
 * Tamanho do bloco = 256 × `.dat[0x34]` (vistos 256 e 512; varia por tabela). Cabeçalho de 512 bytes (`0x1D` = total de blocos); o bloco de índice `i` (a partir de 0) começa em `512 + i × bloco`.
-* O campo memo no registro guarda dois u32. O primeiro aponta o bloco inicial em unidades de 256 bytes contadas a partir de 1: índice = teto((ponteiro − 1) ÷ (bloco ÷ 256)). O segundo nem sempre é o id do bloco: não usar.
-* Cada trecho começa com 18 bytes: anterior (u32, 0 no primeiro), próximo (u32, mesma contagem do ponteiro, 0 = fim), bytes de dados do trecho (u16, contínuos, podem atravessar blocos), id (u32) e tamanho total do memo (u32, só no primeiro trecho). Texto em Windows-1252.
+* O campo memo no registro guarda dois u32: o **número do bloco** inicial (a partir de 1: índice = ponteiro − 1, para qualquer tamanho de bloco) e o **id do memo**. O maior ponteiro de cada tabela é praticamente o total de blocos do arquivo.
+* Cada trecho começa com 18 bytes: anterior (u32, 0 no primeiro), próximo (u32, número de bloco, 0 = fim), bytes de dados do trecho (u16, contínuos, podem atravessar blocos), id (u32, **igual ao 2º u32 do ponteiro**) e tamanho total do memo (u32, só no primeiro trecho). Texto em Windows-1252.
+* O id do cabeçalho é sempre conferido. Se não bater (bloco reaproveitado, `.blb` copiado em momento diferente do `.dat`), o memo sai NULL e é contado como ilegível: nunca se devolve o texto de outro registro.
 * O RecordHash do registro é calculado com os campos memo zerados: alterar só o texto de um memo pode não mudar o hash.
+
+> [!WARNING]
+> Versões anteriores deste projeto (até o commit `1a6eaf3`) dividiam o ponteiro pelo tamanho do bloco. Dava o texto certo só em tabelas de blocos de 256 bytes; nas de 512 devolvia o texto de **outro registro** (válido na estrutura, por isso passava nos testes de formato). Quem gravou memos com essas versões precisa regravar.
 
 ---
 
@@ -92,10 +96,10 @@ Memos de texto são lidos do `.blb` que estiver ao lado do `.dat` (mesmo nome). 
 > Copie o `.dat` e o `.blb` juntos (de preferência de uma cópia de sombra VSS): o `.blb` de outro momento pode apontar memos para blocos já reaproveitados.
 
 ### Desempenho medido
-9 tabelas reais (3,3 milhões de registros e 3,15 milhões de memos, 5,7 GB de `.dat` + `.blb`), com conferência de hash: **5 s** no total, arquivos já em cache do sistema.
+9 tabelas reais (3,3 milhões de registros, 5,7 GB de `.dat` + `.blb`), com conferência de hash: **5 s** no total, arquivos já em cache do sistema.
 
 ### Validação
-Comparado registro a registro com um decodificador independente (todas as linhas e memos de 9 tabelas, sem diferença) e com o BI que lê a mesma base por outro caminho (faturamento de um mês por loja igual ao centavo).
+Comparado registro a registro com um decodificador independente (todas as linhas de 9 tabelas e os 5,1 milhões de memos de 6 tabelas, achados só pelo id do cabeçalho do `.blb`, sem diferença) e com o BI que lê a mesma base por outro caminho (faturamento de um mês por loja igual ao centavo).
 
 ## Licença
 

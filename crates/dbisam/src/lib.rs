@@ -11,14 +11,19 @@
 //!   (MD5 de `registro[25..]` com os campos memo zerados), e depois os campos.
 //! - Cada campo: 1 byte de nulo (0 = NULL, 1 = tem valor) seguido do valor.
 //!
-//! Memos (arquivo `.blb` ao lado do `.dat`, conferido em 3,1 milhões de memos):
-//! - Tamanho do bloco = 256 × `.dat[0x34]` (256 ou 512 nas bases vistas). Cabeçalho de 512 bytes
-//!   (`0x1D` = total de blocos); o bloco de índice `i` (a partir de 0) começa em `512 + i * bloco`.
-//! - O campo memo no registro guarda dois u32: o primeiro aponta o bloco inicial, contado em
-//!   unidades de 256 bytes a partir de 1: índice = teto((ponteiro − 1) / (bloco / 256)).
-//! - Cada trecho começa com 18 bytes: anterior (u32, 0 no primeiro), próximo (u32, mesma contagem do
-//!   ponteiro; 0 = fim), bytes de dados do trecho (u16, contínuos, podem atravessar blocos),
-//!   id (u32) e tamanho total do memo (u32, só no primeiro trecho). Texto em Windows-1252.
+//! Memos (arquivo `.blb` ao lado do `.dat`, conferido em 5,4 milhões de memos de 6 tabelas):
+//! - Tamanho do bloco = 256 × `.dat[0x34]` (256 ou 512 nas bases vistas; muda por tabela). Cabeçalho de
+//!   512 bytes (`0x1D` = total de blocos). O bloco de índice `i` (a partir de 0) começa em `512 + i * bloco`.
+//! - O campo memo no registro guarda dois u32: o **número do bloco** inicial (a partir de 1, ou seja,
+//!   índice = ponteiro − 1, qualquer que seja o tamanho do bloco) e o **id do memo**. O maior ponteiro de
+//!   cada tabela é praticamente igual ao total de blocos do arquivo.
+//! - Cada trecho começa com 18 bytes: anterior (u32, 0 no primeiro), próximo (u32, número de bloco, 0 =
+//!   fim), bytes de dados do trecho (u16, contínuos, podem atravessar blocos), id (u32, igual ao 2º u32 do
+//!   ponteiro: protege contra bloco reaproveitado) e tamanho total do memo (u32, só no primeiro trecho).
+//!   Texto em Windows-1252.
+//! - ATENÇÃO: uma regra anterior deste crate dividia o ponteiro pelo tamanho do bloco. Dava o texto certo só
+//!   na tabela de blocos de 256 bytes e, nas de 512, devolvia o texto de OUTRO registro (estruturalmente
+//!   válido, por isso passou despercebido). Hoje o id do cabeçalho é sempre conferido.
 
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 use memmap2::Mmap;
@@ -169,6 +174,9 @@ pub enum MemoError {
     OutOfRange,
     /// Primeiro trecho inválido (memo regravado depois da cópia?).
     BadHeader,
+    /// O id gravado no bloco não é o do ponteiro: o bloco foi reaproveitado por outro memo (o .blb e o .dat
+    /// foram copiados em momentos diferentes). Nunca devolve o texto de outro registro.
+    IdMismatch,
     /// Encadeamento terminou antes do tamanho total.
     BrokenChain,
 }
@@ -243,21 +251,24 @@ impl Table {
         self.blb.is_some()
     }
 
-    /// Posição no .blb do bloco apontado (ponteiros contam unidades de 256 bytes a partir de 1).
-    fn blob_offset(&self, pointer: u32) -> Option<usize> {
-        if pointer == 0 {
+    /// Posição no .blb do bloco apontado (ponteiros são números de bloco, a partir de 1).
+    fn blob_offset(&self, block_number: u32) -> Option<usize> {
+        if block_number == 0 {
             return None;
         }
-        let k = self.blob_block_size / 256;
-        let index = (pointer as usize - 1).div_ceil(k);
-        Some(HEADER_SIZE + index * self.blob_block_size)
+        Some(HEADER_SIZE + (block_number as usize - 1) * self.blob_block_size)
     }
 
-    /// Lê o conteúdo de um memo a partir do ponteiro de 8 bytes gravado no registro.
-    pub fn read_blob(&self, pointer: &[u8]) -> Result<Vec<u8>, MemoError> {
+    /// Confere só o primeiro trecho do memo (existe, está no arquivo e o id bate), sem ler o texto. Barato:
+    /// serve para saber, para cada registro, se o memo é legível.
+    pub fn blob_ok(&self, pointer: &[u8]) -> bool {
+        self.blob_head(pointer).is_ok()
+    }
+
+    /// Posição e tamanho total do memo, depois de conferir o primeiro trecho.
+    fn blob_head(&self, pointer: &[u8]) -> Result<(usize, usize), MemoError> {
         let blb = self.blb.as_ref().ok_or(MemoError::NoBlobFile)?;
-        let first = u32_at(pointer, 0);
-        let mut at = self.blob_offset(first).ok_or(MemoError::OutOfRange)?;
+        let at = self.blob_offset(u32_at(pointer, 0)).ok_or(MemoError::OutOfRange)?;
         if at + 18 > blb.len() {
             return Err(MemoError::OutOfRange);
         }
@@ -265,6 +276,16 @@ impl Table {
         if u32_at(blb, at) != 0 || total == 0 || u16_at(blb, at + 8) == 0 {
             return Err(MemoError::BadHeader);
         }
+        if u32_at(blb, at + 10) != u32_at(pointer, 4) {
+            return Err(MemoError::IdMismatch);
+        }
+        Ok((at, total))
+    }
+
+    /// Lê o conteúdo de um memo a partir do ponteiro de 8 bytes gravado no registro.
+    pub fn read_blob(&self, pointer: &[u8]) -> Result<Vec<u8>, MemoError> {
+        let blb = self.blb.as_ref().ok_or(MemoError::NoBlobFile)?;
+        let (mut at, total) = self.blob_head(pointer)?;
         let mut data = Vec::with_capacity(total);
         let mut hops = 0;
         loop {
@@ -577,21 +598,24 @@ mod tests {
         assert_eq!(r.value(&t.fields[8]), Value::Null);
     }
 
-    fn put_segment(blb: &mut Vec<u8>, at: usize, prev: u32, next: u32, used: u16, total: u32, data: &[u8]) {
+    /// Grava um trecho de memo no formato real: anterior, próximo (números de bloco), bytes do trecho, id, total.
+    fn put_segment(blb: &mut Vec<u8>, at: usize, prev: u32, next: u32, used: u16, id: u32, total: u32, data: &[u8]) {
         if blb.len() < at + 18 + data.len() {
             blb.resize(at + 18 + data.len(), 0);
         }
         blb[at..at + 4].copy_from_slice(&prev.to_le_bytes());
         blb[at + 4..at + 8].copy_from_slice(&next.to_le_bytes());
         blb[at + 8..at + 10].copy_from_slice(&used.to_le_bytes());
+        blb[at + 10..at + 14].copy_from_slice(&id.to_le_bytes());
         blb[at + 14..at + 18].copy_from_slice(&total.to_le_bytes());
         blb[at + 18..at + 18 + data.len()].copy_from_slice(data);
     }
 
-    fn table_with_memo(k: u8, pointer: u32, blb: Vec<u8>) -> Table {
+    /// Tabela de um campo memo com o ponteiro (bloco, id) já gravado no registro.
+    fn table_with_memo(k: u8, block: u32, id: u32, blb: Vec<u8>) -> Table {
         let specs = [Spec { name: "Obs", type_id: 3, decl: 0, size: 8 }];
-        let mut ptr = pointer.to_le_bytes().to_vec();
-        ptr.extend_from_slice(&pointer.to_le_bytes());
+        let mut ptr = block.to_le_bytes().to_vec();
+        ptr.extend_from_slice(&id.to_le_bytes());
         let mut dat = build(&specs, &[Some(ptr)]);
         dat[0x34] = k;
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -606,12 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn memo_continuo_em_blocos_de_512() {
-        // ponteiro 3 com bloco de 512 (k = 2): índice teto(2/2) = 1 -> posição 512 + 512
+    fn ponteiro_e_o_numero_do_bloco_em_blocos_de_512() {
+        // bloco 3 (índice 2) com bloco de 512 bytes: posição 512 + 2 * 512. Antes a regra dividia por 2 e
+        // caía no bloco errado: aqui o bloco 2 tem OUTRO memo e precisa ser ignorado.
         let text: Vec<u8> = (0..700).map(|i| b'a' + (i % 26) as u8).collect();
         let mut blb = vec![0u8; 512];
-        put_segment(&mut blb, 1024, 0, 0, 700, 700, &text);
-        let t = table_with_memo(2, 3, blb);
+        put_segment(&mut blb, 512 + 512, 0, 0, 5, 8, 5, b"outro");
+        put_segment(&mut blb, 512 + 2 * 512, 0, 0, 700, 77, 700, &text);
+        let t = table_with_memo(2, 3, 77, blb);
         assert_eq!(t.blob_block_size, 512);
         let v = t.record(0).value_resolved(&t.fields[0], false).unwrap();
         assert_eq!(v, Value::Text(String::from_utf8(text).unwrap()));
@@ -619,13 +645,13 @@ mod tests {
 
     #[test]
     fn memo_encadeado_em_blocos_de_256() {
-        // ponteiro 2 (k = 1): índice 1 -> 512 + 256; continua no ponteiro 4 -> 512 + 3 * 256
+        // bloco 2 (índice 1) continua no bloco 4 (índice 3); o próximo também é número de bloco
         let part1 = vec![b'x'; 238];
-        let part2 = b"FIM \xc7\xc3O".to_vec();
+        let part2 = b"FIM \xc7\xc3O".to_vec(); // Windows-1252: "FIM ÇÃO"
         let mut blb = vec![0u8; 512];
-        put_segment(&mut blb, 768, 0, 4, 238, (238 + part2.len()) as u32, &part1);
-        put_segment(&mut blb, 512 + 3 * 256, 2, 0, part2.len() as u16, 0, &part2);
-        let t = table_with_memo(1, 2, blb);
+        put_segment(&mut blb, 512 + 256, 0, 4, 238, 9, (238 + part2.len()) as u32, &part1);
+        put_segment(&mut blb, 512 + 3 * 256, 2, 0, part2.len() as u16, 9, 0, &part2);
+        let t = table_with_memo(1, 2, 9, blb);
         match t.record(0).value_resolved(&t.fields[0], false).unwrap() {
             Value::Text(s) => {
                 assert_eq!(s.len(), 238 + "FIM ÇÃO".len());
@@ -636,8 +662,19 @@ mod tests {
     }
 
     #[test]
+    fn id_diferente_nao_devolve_texto_de_outro_memo() {
+        // bloco reaproveitado: o id do cabeçalho (5) não é o do ponteiro (6)
+        let mut blb = vec![0u8; 512];
+        put_segment(&mut blb, 512, 0, 0, 4, 5, 4, b"velho");
+        let t = table_with_memo(1, 1, 6, blb);
+        assert_eq!(t.record(0).value_resolved(&t.fields[0], false), Err(MemoError::IdMismatch));
+        assert!(!t.blob_ok(&[1, 0, 0, 0, 6, 0, 0, 0]));
+        assert!(t.blob_ok(&[1, 0, 0, 0, 5, 0, 0, 0]));
+    }
+
+    #[test]
     fn memo_fora_do_arquivo_da_erro() {
-        let t = table_with_memo(1, 99, vec![0u8; 512]);
+        let t = table_with_memo(1, 99, 1, vec![0u8; 512]);
         assert_eq!(t.record(0).value_resolved(&t.fields[0], false), Err(MemoError::OutOfRange));
     }
 

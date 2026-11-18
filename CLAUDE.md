@@ -18,7 +18,7 @@ Leitura de tabelas DBISAM 4 (`.dat` + `.blb`) direto do arquivo, sem driver. Wor
 
 ## Estado (nov/2026, versão 0.2)
 
-Refeito em nov/2026. Validado em 9 tabelas reais (3,3 milhões de registros e 3,15 milhões de memos): igual a um decodificador independente escrito à parte, em todas as linhas e memos, e o faturamento de um mês bateu ao centavo com um BI que lê a mesma base por outro caminho. 9 tabelas (5,7 GB) em ~5 s com os arquivos em cache.
+Refeito em nov/2026. Validado em 9 tabelas reais (3,3 milhões de registros; memos de 6 tabelas, 5,1 milhões, conferidos pelo id do cabeçalho): igual a um decodificador independente escrito à parte, em todas as linhas e memos, e o faturamento de um mês bateu ao centavo com um BI que lê a mesma base por outro caminho. 9 tabelas (5,7 GB) em ~5 s com os arquivos em cache.
 
 ## Armadilhas já encontradas (não repetir)
 
@@ -27,7 +27,8 @@ Refeito em nov/2026. Validado em 9 tabelas reais (3,3 milhões de registros e 3,
 - **Tamanho do campo = `descritor[0xA9]`** (não deduzir pela distância entre campos). Booleano tem 2 bytes; data e hora tem 8 (double em ms, ordinal); hora 4 (ms desde a meia-noite).
 - **Byte de nulo** antes de cada campo (0 = NULL).
 - **RecordHash = MD5 de `registro[25..]` com os campos memo zerados.** Mudar só o texto de um memo pode não mudar o hash.
-- **`.blb`:** bloco = 256 × `.dat[0x34]` (256 ou 512, varia por tabela). O ponteiro conta unidades de 256 a partir de 1: índice = teto((p − 1) / (bloco / 256)). O 2º u32 do ponteiro não é confiável. Trechos contínuos podem atravessar blocos (`bytes do trecho` > bloco − 18).
+- **`.blb`:** bloco = 256 × `.dat[0x34]` (256 ou 512, varia por tabela). O ponteiro é o **número do bloco** (índice = p1 − 1, qualquer que seja o tamanho do bloco) e o 2º u32 é o **id do memo**, igual ao id do cabeçalho do trecho: sempre conferir. Trechos contínuos podem atravessar blocos (`bytes do trecho` > bloco − 18).
+- **ERRO JÁ COMETIDO (18/11/2026):** a 1ª versão dividia o ponteiro pelo tamanho do bloco. Funcionava só na tabela de blocos de 256 bytes; nas de 512 lia o texto de OUTRO registro, e o teste "estrutura válida + cadeia completa" passava. Memo só se prova pelo id do cabeçalho ou pelo conteúdo (ex.: `ExProps` é sempre `CHAVE=valor`), nunca só pela estrutura.
 - Texto em Windows-1252 decodificado como WHATWG (`encoding_rs`): bytes sem caractere (0x81, 0x8D...) viram o mesmo código; o Python precisa de um tratador próprio para comparar.
 - No Windows, arquivo mapeado não pode ser sobrescrito: nos testes, usar um nome de arquivo por teste.
 - `.dat` e `.blb` copiados em momentos diferentes podem apontar memos para blocos reaproveitados.
