@@ -1,0 +1,11 @@
+[package]
+name = "dbisam"
+version = "0.2.0"
+edition = "2024"
+description = "Leitura direta de tabelas DBISAM 4 (.dat): estrutura, registros, tipos e hash de registro"
+
+[dependencies]
+memmap2 = "0.9"
+encoding_rs = "0.8.35"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+md5 = "0.7"

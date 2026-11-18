@@ -1,84 +1,101 @@
 # 🛠️ DBISAM-Translate
 
-Conjunto de ferramentas em Rust de alta performance para engenharia reversa e extração de dados de arquivos binários **DBISAM (.dat)**. 
+Conjunto de ferramentas em Rust de alta performance para engenharia reversa e extração de dados de arquivos binários **DBISAM (.dat)**, sem driver.
 
-Este projeto é dividido em dois módulos principais integrados via um Workspace Rust: um para mapeamento estrutural e outro para extração massiva.
+Workspace com três crates:
 
-## 📁 Estrutura do Projeto
+* **dbisam** (biblioteca): lê a estrutura direto do cabeçalho do `.dat`, percorre os registros e decodifica cada tipo. É a base dos outros dois.
+* **DBISAM-Scan**: varre uma pasta de `.dat` e gera o `schema.toml` com a estrutura de todas as tabelas.
+* **DBISAM-Loader**: extrai tabelas para CSV pronto para o `COPY` do PostgreSQL, usando `mmap` e vários núcleos.
 
-* **DBISAM-Scan**: Varre diretórios em busca de arquivos `.dat`, identifica a estrutura de colunas, tipos de dados e offsets, gerando um mapa técnico em TOML.
-* **DBISAM-Loader**: Utiliza o mapa gerado pelo Scan para realizar a extração dos dados binários para CSV, utilizando `Memory Mapping (mmap)` para performance extrema.
+---
+
+## 📐 Formato DBISAM 4 (conferido em bases reais)
+
+* **Cabeçalho (512 bytes):** `0x29` total de registros (u32), `0x2D` tamanho do registro (u16), `0x2F` número de campos (u16).
+  O total de registros pode ficar **atrás** do arquivo quando ele é copiado com o sistema gravando: o Loader lê todas as posições, não para no total do cabeçalho.
+* **Descritor de campo (768 bytes cada, a partir de `0x200`):** `[2]` tamanho do nome, `[3..]` nome, `[0xA4]` tipo, `[0xA5]` subtipo, `[0xA6]` tamanho declarado (u16), `[0xA9]` bytes no registro (u16), `[0xAC]` posição no registro (u16).
+* **Registro:** `[0]` situação (0 = ativo), `[5..9]` RecordID (sobe a cada inserção), `[9..25]` RecordHash = MD5 de `registro[25..]` com os campos memo zerados (muda quando o registro é alterado: serve para replicação incremental). Depois vêm os campos.
+* **Campo:** 1 byte de nulo (0 = NULL, 1 = tem valor) e depois o valor.
+
+| tipo | DBISAM | bytes | como é gravado |
+|---|---|---|---|
+| 1 | String | declarado + 1 | Windows-1252, termina em `\0` |
+| 2 | Date | 4 | dias, ordinal (01/01/0001 = 1) |
+| 3 | Blob/Memo | 8 | ponteiro para o `.blb` (subtipo 22 memo, 26 imagem) |
+| 4 | Boolean | 2 | 0/1 |
+| 6 | Integer | 4 | i32 (subtipo 29 = autoincremento) |
+| 7 | Float | 8 | f64 (subtipo 21 = moeda) |
+| 10 | Time | 4 | milissegundos desde a meia-noite |
+| 11 | TimeStamp | 8 | f64 em milissegundos; ms / 86.400.000 = ordinal do dia |
+
+Tipos 5 (SmallInt), 8 (BCD), 9 (Bytes), 12 (Word), 13 (LargeInt) e 14 (AutoInc) seguem a numeração do DBISAM mas **ainda não foram vistos em base real**: o Scan e o Loader avisam quando aparecem.
+
+### Memos (arquivo `.blb`)
+
+* Tamanho do bloco = 256 × `.dat[0x34]` (vistos 256 e 512; varia por tabela). Cabeçalho de 512 bytes (`0x1D` = total de blocos); o bloco de índice `i` (a partir de 0) começa em `512 + i × bloco`.
+* O campo memo no registro guarda dois u32. O primeiro aponta o bloco inicial em unidades de 256 bytes contadas a partir de 1: índice = teto((ponteiro − 1) ÷ (bloco ÷ 256)). O segundo nem sempre é o id do bloco: não usar.
+* Cada trecho começa com 18 bytes: anterior (u32, 0 no primeiro), próximo (u32, mesma contagem do ponteiro, 0 = fim), bytes de dados do trecho (u16, contínuos, podem atravessar blocos), id (u32) e tamanho total do memo (u32, só no primeiro trecho). Texto em Windows-1252.
+* O RecordHash do registro é calculado com os campos memo zerados: alterar só o texto de um memo pode não mudar o hash.
 
 ---
 
 ## 🔍 DBISAM-Scan
 
-O Scan é a ferramenta de reconhecimento. Ele identifica tipos como String, Integer, Float e Date, além de calcular o `record_size` real (incluindo o byte de status/delete do DBISAM).
-
-### Baixar o executável
-1. Vá até a aba [Releases](https://github.com/murilo813/DBISAM-Translate/releases).
-2. Baixe o `scan.exe`.
-
-Ou se preferir
-
 ### Como gerar o executável
-1. Na pasta raiz do DBISAM-Translate rode 'cargo build -p DBISAM-Scan --release'.
-2. O executável será gerado na pasta target/release (DBISAM-Scan.exe).
+`cargo build -p DBISAM-Scan --release` (sai em `target/release/DBISAM-Scan.exe`).
 
 ### Como usar
-1. Jogue o executável dentro da pasta que contém os arquivos `.dat`.
-2. Execute o `DBISAM-Scan.exe`.
-3. Um arquivo `schema.toml` será gerado com todo o mapeamento das tabelas.
-
-### 📄 Exemplo de `schema.toml` gerado:
-O Scan identifica a estrutura e organiza as colunas por offset:
+Coloque o executável na pasta dos `.dat` (ou defina `DB_PATH` no `.env`) e execute. Ele gera o `schema.toml`:
 
 ```toml
-[Tabela1]
-record_size = 2864
+[Vendedores]
+record_size = 496
 
-[[Tabela1.columns]]
+[[Vendedores.columns]]
 name = "ID"
 field_type = "I"
 offset = 25
-
-[Tabela2]
-record_size = 152
-
-[[Tabela2.columns]]
-name = "nome"
-field_type = "S"
-offset = 40
+length = 4
+type_id = 6
+size = 4
 ```
+
+`field_type`: `S` texto, `I` inteiro (`length` 1 = booleano, 2 = smallint, 4 = integer), `F` float, `D` data, `T` hora, `TS` data e hora, `M` memo/blob, `L` inteiro de 8 bytes, `X` bytes/BCD/desconhecido. `type_id` e `size` são o tipo e o tamanho originais do DBISAM. Quem lê o formato antigo (name, field_type, offset, length) continua funcionando e trata os códigos novos como texto.
 
 ---
 
 ## 🚀 DBISAM-Loader
 
-O Loader é o motor de extração. Ele consome o `schema.toml` e despeja os dados em arquivos CSV prontos para importação em bancos modernos (PostgreSQL, MySQL, etc).
-
-### Baixar o executável
-1. Vá até a aba [Releases](https://github.com/murilo813/DBISAM-Translate/releases).
-2. Baixe o `DBISAM-Loader.exe`.
-
-Ou se preferir
+O Loader **não precisa do `schema.toml`**: lê a estrutura de cada `.dat`, então continua certo quando o sistema altera uma tabela (coluna nova, campo maior).
 
 ### Como gerar o executável
-1. Na pasta raiz do DBISAM-Translate rode 'cargo build -p DBISAM-Loader --release'.
-2. O executável será gerado na pasta target/release (DBISAM-Loader.exe).
+`cargo build -p DBISAM-Loader --release` (sai em `target/release/DBISAM-Loader.exe`).
 
 ### Como usar
-O schema.toml será usado aqui, o coloque na pasta raíz do seu DBISAM-Loader.exe, ele exige também um arquivo `.env` na raiz do projeto para funcionar:
-```env
-TARGET_TABLE=NomeDaTabela (sem o .dat)
-DB_PATH=C:\caminho\para\os\arquivos_dat
-```
----
+Variáveis no `.env` (ao lado do executável) ou no ambiente:
 
-[!IMPORTANT]
-**Aviso sobre Tipagem Dinâmica (Booleanos/Inteiros):**
-O DBISAM é traiçoeiro com campos lógicos e inteiros. O scanner calcula o tamanho (1 byte ou 4 bytes) baseando-se no **espaço real(gap)** entre as colunas do arquivo binário. Isso evita "lixo de memória" e garante que o motor leia exatamente o que está no disco, mesmo qe o cabeçalho original seja inconscitente.
-Sobre os booleanos, no dbisam eles são 0 e 1, por isso são mapeados como "I".
+```env
+DB_PATH=C:\caminho\para\os\arquivos_dat
+TARGET_TABLE=NFMestre            # uma tabela, várias separadas por vírgula, ou * para todas
+OUTPUT_DIR=C:\saida              # opcional (padrão: pasta atual)
+RECORD_META=1                    # opcional: colunas _record_id e _record_hash
+VERIFY_HASH=0                    # opcional: não confere o hash de cada registro
+BLOB_BINARY=1                    # opcional: grava blobs binários (imagens) como bytea \x...; padrão NULL
+```
+
+Saída `extracao_<tabela>.csv`: cabeçalho com os nomes das colunas; **NULL = campo vazio sem aspas**; texto sempre entre aspas (texto vazio = `""`); datas `AAAA-MM-DD`; hora `HH:MM:SS.mmm`; data e hora `AAAA-MM-DD HH:MM:SS.mmm`; números com precisão total; booleanos `true`/`false`. Carrega direto com `COPY tabela FROM 'arquivo' (FORMAT csv, HEADER true)`.
+
+Memos de texto são lidos do `.blb` que estiver ao lado do `.dat` (mesmo nome). No fim de cada tabela o Loader mostra registros, tempo, total do cabeçalho x posições no arquivo, apagados, registros com hash inválido (registro pela metade: arquivo em uso), memos lidos, memos sem o `.blb` e memos ilegíveis (`.blb` copiado em outro momento que o `.dat`). Memo sem `.blb` ou ilegível sai NULL.
+
+> [!IMPORTANT]
+> Copie o `.dat` e o `.blb` juntos (de preferência de uma cópia de sombra VSS): o `.blb` de outro momento pode apontar memos para blocos já reaproveitados.
+
+### Desempenho medido
+9 tabelas reais (3,3 milhões de registros e 3,15 milhões de memos, 5,7 GB de `.dat` + `.blb`), com conferência de hash: **5 s** no total, arquivos já em cache do sistema.
+
+### Validação
+Comparado registro a registro com um decodificador independente (todas as linhas e memos de 9 tabelas, sem diferença) e com o BI que lê a mesma base por outro caminho (faturamento de um mês por loja igual ao centavo).
 
 ## Licença
 

@@ -1,183 +1,249 @@
-use memmap2::Mmap;
-use serde::Deserialize;
-use std::collections::BTreeMap;
+//! DBISAM-Loader: extrai tabelas DBISAM (.dat) para CSV pronto para o COPY do PostgreSQL.
+//!
+//! A estrutura é lida do próprio .dat (não depende do schema.toml), então continua certa quando o
+//! sistema muda a tabela. Configuração por variáveis de ambiente (ou .env ao lado do executável):
+//! - `DB_PATH`: pasta dos .dat.
+//! - `TARGET_TABLE`: uma tabela, várias separadas por vírgula, ou `*` para todas.
+//! - `OUTPUT_DIR`: pasta dos CSV (padrão: pasta atual).
+//! - `RECORD_META=1`: acrescenta as colunas `_record_id` e `_record_hash` (para replicação incremental).
+//! - `VERIFY_HASH=0`: não confere o hash de cada registro (padrão: confere).
+//!
+//! - `BLOB_BINARY=1`: grava também blobs binários (imagens) em hexadecimal bytea (`\x...`); padrão: NULL.
+//!
+//! CSV: cabeçalho com os nomes das colunas; NULL = campo vazio sem aspas; texto sempre entre aspas
+//! (texto vazio = ""); datas ISO; números com precisão total. Memos de texto são lidos do .blb ao
+//! lado do .dat; sem o .blb (ou com o memo ilegível) saem NULL e entram na contagem do resumo.
+
+use dbisam::{MemoError, Table, Value};
+use rayon::prelude::*;
 use std::env;
+use std::fmt::Write as _;
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-#[derive(Deserialize, Debug)]
-struct Column {
-    name: String,
-    field_type: String,
-    offset: u32,
-    length: u32,
+const CHUNK: usize = 20_000;
+
+struct Options {
+    record_meta: bool,
+    verify_hash: bool,
+    blob_binary: bool,
 }
 
-#[derive(Deserialize, Debug)]
-struct TableConfig {
-    record_size: u32,
-    columns: Vec<Column>,
+#[derive(Default)]
+struct Stats {
+    active: usize,
+    deleted: usize,
+    bad_hash: usize,
+    memos_read: usize,
+    memos_no_file: usize,
+    memos_bad: usize,
+    raw_values: usize,
 }
 
-type SchemaConfig = BTreeMap<String, TableConfig>;
+impl Stats {
+    fn add(&mut self, o: &Stats) {
+        self.active += o.active;
+        self.deleted += o.deleted;
+        self.bad_hash += o.bad_hash;
+        self.memos_read += o.memos_read;
+        self.memos_no_file += o.memos_no_file;
+        self.memos_bad += o.memos_bad;
+        self.raw_values += o.raw_values;
+    }
+}
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(dir) = exe_path.parent() {
-            let env_path = dir.join(".env");
-            dotenvy::from_path(&env_path).ok();
+fn main() {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dotenvy::from_path(dir.join(".env")).ok();
         }
     }
-
     dotenvy::dotenv().ok();
 
-    let target_table = env::var("TARGET_TABLE")
-        .map(|v| v.replace('"', ""))
-        .unwrap_or_else(|_| {
-            println!("⚠️ TARGET_TABLE não encontrada no .env, usando padrão: Pessoas");
-            "Pessoas".to_string()
-        });
+    let base = PathBuf::from(env::var("DB_PATH").map(|v| v.replace('"', "")).unwrap_or_else(|_| r"C:\BmSoft\Bases\zecao".into()));
+    let target = env::var("TARGET_TABLE").map(|v| v.replace('"', "")).unwrap_or_else(|_| "Pessoas".into());
+    let out_dir = PathBuf::from(env::var("OUTPUT_DIR").unwrap_or_else(|_| ".".into()));
+    let opts = Options {
+        record_meta: env::var("RECORD_META").map(|v| v == "1").unwrap_or(false),
+        verify_hash: env::var("VERIFY_HASH").map(|v| v != "0").unwrap_or(true),
+        blob_binary: env::var("BLOB_BINARY").map(|v| v == "1").unwrap_or(false),
+    };
 
-    let base_path = env::var("DB_PATH")
-        .map(|v| v.replace('"', ""))
-        .unwrap_or_else(|_| {
-            let path = r"C:\BmSoft\Bases\zecao".to_string();
-            println!("⚠️ DB_PATH não encontrado no .env, usando padrão: {}", path);
-            path
-        });
-
-    let toml_content =
-        std::fs::read_to_string("schema.toml").expect("ERRO: schema.toml não encontrado na raiz");
-
-    let schema: SchemaConfig = toml::from_str(&toml_content)?;
-
-    let config = schema
-        .get(&target_table)
-        .expect("ERRO: Tabela não encontrada no schema.toml");
-
-    let file_path = format!(r"{}\{}.dat", base_path, target_table);
-    let mut file = File::open(&file_path)?;
-
-    let mut h = [0u8; 512];
-    file.read_exact(&mut h)?;
-
-    let total_rows = u32::from_le_bytes(h[0x29..0x2D].try_into()?);
-    let total_fields = u16::from_le_bytes(h[0x2F..0x31].try_into()?);
-
-    let row_size = config.record_size as usize;
-    let data_offset = 0x200 + (total_fields as usize * 768);
-
-    println!("Extraindo {} | {} registros...", target_table, total_rows);
-
-    let mmap = unsafe { Mmap::map(&file)? };
-    let output_name = format!("extracao_{}.csv", target_table.to_lowercase());
-    let mut wtr = csv::Writer::from_path(&output_name)?;
-
-    let headers: Vec<String> = config.columns.iter().map(|c| c.name.clone()).collect();
-    wtr.write_record(&headers)?;
-
-    let mut count = 0;
-    let mut i = data_offset;
-    let cols_len = config.columns.len();
-
-    while i + row_size <= mmap.len() {
-        if let Some(row_data) = mmap.get(i..i + row_size) {
-            if row_data[0] == 0 {
-                let mut row_values = Vec::with_capacity(cols_len);
-
-                for col in &config.columns {
-                    let start = col.offset as usize + 1;
-                    let end = (start + col.length as usize).min(row_size);
-
-                    let val = match col.field_type.as_str() {
-                        "S" => {
-                            if let Some(slice) = row_data.get(start..end) {
-                                decode_windows1252(slice)
-                            } else {
-                                String::new()
-                            }
-                        }
-                        "I" => {
-                            if let Some(slice) = row_data.get(start..end) {
-                                if col.length == 1 {
-                                    if slice[0] == 0 {
-                                        "false".to_string()
-                                    } else {
-                                        "true".to_string()
-                                    }
-                                } else {
-                                    let mut b = [0u8; 4];
-                                    let n = slice.len().min(4);
-                                    b[..n].copy_from_slice(&slice[..n]);
-                                    i32::from_le_bytes(b).to_string()
-                                }
-                            } else {
-                                "0".to_string()
-                            }
-                        }
-                        "F" => {
-                            if let Some(slice) = row_data.get(start..end) {
-                                let mut b = [0u8; 8];
-                                let n = slice.len().min(8);
-                                b[..n].copy_from_slice(&slice[..n]);
-                                format!("{:.4}", f64::from_le_bytes(b))
-                            } else {
-                                "0.0000".to_string()
-                            }
-                        }
-                        "D" => {
-                            if let Some(slice) = row_data.get(start..end) {
-                                let mut b = [0u8; 4];
-                                let n = slice.len().min(4);
-                                b[..n].copy_from_slice(&slice[..n]);
-                                let days = i32::from_le_bytes(b);
-                                if days > 0 {
-                                    convert_dbisam_to_iso(days)
-                                } else {
-                                    String::new()
-                                }
-                            } else {
-                                String::new()
-                            }
-                        }
-                        "B" => "[BIN]".to_string(),
-                        _ => String::new(),
-                    };
-                    row_values.push(val);
-                }
-                wtr.write_record(&row_values)?;
-                count += 1;
-            }
-        }
-
-        i += row_size;
-        if count >= total_rows {
-            break;
-        }
+    let tables: Vec<PathBuf> = if target.trim() == "*" {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(&base)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dat")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    } else {
+        target.split(',').map(|t| base.join(format!("{}.dat", t.trim()))).collect()
+    };
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("ERRO: não consegui criar {}: {e}", out_dir.display());
+        std::process::exit(1);
     }
 
-    wtr.flush()?;
+    let mut failures = 0;
+    for path in &tables {
+        if let Err(e) = extract(path, &out_dir, &opts) {
+            eprintln!("ERRO em {}: {e}", path.display());
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn extract(path: &Path, out_dir: &Path, opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let table = Table::open(path)?;
+    let out_path = out_dir.join(format!("extracao_{}.csv", table.name.to_lowercase()));
+    let mut out = BufWriter::with_capacity(8 << 20, File::create(&out_path)?);
+
+    let mut header: Vec<String> = Vec::new();
+    if opts.record_meta {
+        header.push("_record_id".into());
+        header.push("_record_hash".into());
+    }
+    header.extend(table.fields.iter().map(|f| f.name.clone()));
+    writeln!(out, "{}", header.join(","))?;
+
+    let slots = table.slots();
+    let chunks: Vec<(usize, usize)> = (0..slots).step_by(CHUNK).map(|s| (s, (s + CHUNK).min(slots))).collect();
+    let batch = rayon::current_num_threads().max(1) * 2;
+    let mut stats = Stats::default();
+    for group in chunks.chunks(batch) {
+        let parts: Vec<(String, Stats)> = group.par_iter().map(|&(a, b)| render(&table, a, b, opts)).collect();
+        for (text, s) in parts {
+            out.write_all(text.as_bytes())?;
+            stats.add(&s);
+        }
+    }
+    out.flush()?;
+
+    let unverified: Vec<String> = table
+        .fields
+        .iter()
+        .filter(|f| !f.kind.verified())
+        .map(|f| format!("{} (tipo {})", f.name, f.type_id))
+        .collect();
+    let mut notes = Vec::new();
+    if opts.verify_hash {
+        notes.push(format!("hash inválido {}", stats.bad_hash));
+    }
+    if stats.memos_read > 0 {
+        notes.push(format!("memos lidos {}", stats.memos_read));
+    }
+    if stats.memos_no_file > 0 {
+        notes.push(format!("memos sem o .blb (saíram NULL) {}", stats.memos_no_file));
+    }
+    if stats.memos_bad > 0 {
+        notes.push(format!("memos ilegíveis (saíram NULL) {}", stats.memos_bad));
+    }
+    if table.trailing_bytes() > 0 {
+        notes.push(format!("{} bytes de registro incompleto no fim", table.trailing_bytes()));
+    }
+    if stats.raw_values > 0 {
+        notes.push(format!("{} valores em hexadecimal (tipo não reconhecido)", stats.raw_values));
+    }
     println!(
-        "Finalizado: {} registros extraídos para {}",
-        count, output_name
+        "{}: {} registros -> {} | {:.1} s | cabeçalho diz {}, posições no arquivo {}, apagados {}{}",
+        table.name,
+        stats.active,
+        out_path.display(),
+        started.elapsed().as_secs_f64(),
+        table.header_rows,
+        slots,
+        stats.deleted,
+        notes.iter().map(|n| format!(", {n}")).collect::<String>(),
     );
+    if !unverified.is_empty() {
+        println!("   AVISO: tipos ainda não conferidos em base real: {}", unverified.join(", "));
+    }
+    if stats.memos_bad > 0 {
+        println!("   AVISO: memos ilegíveis costumam ser .blb copiado em outro momento que o .dat. Copie os dois juntos (ou use VSS).");
+    }
+    if opts.verify_hash && stats.bad_hash > 0 {
+        println!("   AVISO: registros com hash inválido podem estar pela metade (arquivo em uso). Extraia de novo ou use uma cópia de sombra (VSS).");
+    }
     Ok(())
 }
 
-fn decode_windows1252(bytes: &[u8]) -> String {
-    let (res, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
-    res.trim_matches(|c: char| c == '\0' || c.is_whitespace())
-        .to_string()
-}
-
-fn convert_dbisam_to_iso(days: i32) -> String {
-    let epoch_days = days - 719163;
-    let seconds = (epoch_days as i64) * 86400;
-    if let Some(t) = std::time::SystemTime::UNIX_EPOCH
-        .checked_add(std::time::Duration::from_secs(seconds.max(0) as u64))
-    {
-        let datetime: chrono::DateTime<chrono::Utc> = t.into();
-        return datetime.format("%Y-%m-%d").to_string();
+fn render(table: &Table, from: usize, to: usize, opts: &Options) -> (String, Stats) {
+    let mut s = String::with_capacity((to - from) * table.record_size / 2);
+    let mut st = Stats::default();
+    for slot in from..to {
+        let r = table.record(slot);
+        if !r.is_active() {
+            st.deleted += 1;
+            continue;
+        }
+        st.active += 1;
+        if opts.verify_hash && !r.hash_ok() {
+            st.bad_hash += 1;
+        }
+        let mut first = true;
+        if opts.record_meta {
+            let _ = write!(s, "{}", r.record_id());
+            s.push(',');
+            for b in r.stored_hash() {
+                let _ = write!(s, "{b:02x}");
+            }
+            first = false;
+        }
+        for f in &table.fields {
+            if !first {
+                s.push(',');
+            }
+            first = false;
+            let value = match r.value_resolved(f, opts.blob_binary) {
+                Ok(v) => {
+                    if matches!(r.value(f), Value::Blob(_)) && !matches!(v, Value::Null) {
+                        st.memos_read += 1;
+                    }
+                    v
+                }
+                Err(MemoError::NoBlobFile) => {
+                    st.memos_no_file += 1;
+                    Value::Null
+                }
+                Err(_) => {
+                    st.memos_bad += 1;
+                    Value::Null
+                }
+            };
+            match value {
+                Value::Null => {}
+                Value::Text(t) => {
+                    s.push('"');
+                    for ch in t.chars() {
+                        if ch == '"' {
+                            s.push('"');
+                        }
+                        s.push(ch);
+                    }
+                    s.push('"');
+                }
+                // Não deveria sobrar ponteiro sem resolver; por garantia sai NULL.
+                Value::Blob(_) => {}
+                v @ Value::Raw(_) => {
+                    st.raw_values += 1;
+                    let _ = write!(s, "{v}");
+                }
+                v => {
+                    let _ = write!(s, "{v}");
+                }
+            }
+        }
+        s.push('\n');
     }
-    "".to_string()
+    (s, st)
 }

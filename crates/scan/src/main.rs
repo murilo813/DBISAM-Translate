@@ -1,178 +1,102 @@
-use serde::{Deserialize, Serialize};
+//! DBISAM-Scan: varre uma pasta de .dat e gera o schema.toml com a estrutura de cada tabela.
+//!
+//! Compatível com o formato antigo (name, field_type, offset, length) e com campos novos:
+//! - `type_id`: tipo DBISAM original; `size`: bytes do valor no registro.
+//! - field_type: S texto, I inteiro (length 1 = booleano, 2 = smallint, 4 = integer), F float, D data,
+//!   T hora, TS data e hora, M memo/blob, L inteiro de 8 bytes, X bytes/BCD/desconhecido.
+//!   (Quem lê o schema.toml antigo trata T, TS, M, L e X como texto.)
+
+use dbisam::{Field, FieldKind, Table};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::fs;
 use walkdir::WalkDir;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct TableConfig {
-    record_size: u32,
-    columns: Vec<Column>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize)]
 struct Column {
     name: String,
     field_type: String,
     offset: u32,
     length: u32,
-    #[serde(skip)]
     type_id: u8,
+    size: u32,
 }
 
-type SchemaConfig = BTreeMap<String, TableConfig>;
+#[derive(Serialize)]
+struct TableConfig {
+    record_size: u32,
+    columns: Vec<Column>,
+}
+
+fn column(f: &Field) -> Column {
+    let (ft, length) = match f.kind {
+        FieldKind::Text => ("S", f.declared_len as u32),
+        FieldKind::Boolean => ("I", 1),
+        FieldKind::SmallInt | FieldKind::Word => ("I", 2),
+        FieldKind::Integer | FieldKind::AutoInc => ("I", 4),
+        FieldKind::LargeInt => ("L", 8),
+        FieldKind::Float => ("F", 8),
+        FieldKind::Date => ("D", 4),
+        FieldKind::Time => ("T", 4),
+        FieldKind::Timestamp => ("TS", 8),
+        FieldKind::Blob => ("M", f.size as u32),
+        FieldKind::Bcd | FieldKind::Bytes | FieldKind::Unknown(_) => ("X", f.size as u32),
+    };
+    Column { name: f.name.clone(), field_type: ft.into(), offset: f.offset as u32, length, type_id: f.type_id, size: f.size as u32 }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(dir) = exe_path.parent() {
-            let env_path = dir.join(".env");
-            dotenvy::from_path(&env_path).ok();
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dotenvy::from_path(dir.join(".env")).ok();
         }
     }
-
     dotenvy::dotenv().ok();
 
-    let base_path = env::var("DB_PATH")
-        .map(|v| v.replace('"', ""))
-        .unwrap_or_else(|_| {
-            let fallback = env::current_dir().unwrap().to_string_lossy().to_string();
-            println!(
-                "⚠️ AVISO: Variável DB_PATH não encontrada. Usando pasta atual: {}",
-                fallback
-            );
-            fallback
-        });
+    let base = env::var("DB_PATH").map(|v| v.replace('"', "")).unwrap_or_else(|_| {
+        let cwd = env::current_dir().unwrap().to_string_lossy().to_string();
+        println!("AVISO: DB_PATH não encontrado. Usando a pasta atual: {cwd}");
+        cwd
+    });
 
-    let output_file = "schema.toml";
-    let mut full_schema: SchemaConfig = BTreeMap::new();
-
-    for entry in WalkDir::new(&base_path).into_iter().filter_map(|e| e.ok()) {
+    let mut schema: BTreeMap<String, TableConfig> = BTreeMap::new();
+    let mut unverified: BTreeMap<u8, Vec<String>> = BTreeMap::new();
+    let mut errors = 0;
+    for entry in WalkDir::new(&base).into_iter().filter_map(Result::ok) {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("dat") {
-            let table_name = path.file_stem().unwrap().to_string_lossy().to_string();
-
-            if let Some(table_config) = analyze_dat_file(path)
-                .ok()
-                .filter(|tc| !tc.columns.is_empty())
-            {
-                println!(
-                    "Tabela: {} ({} colunas)",
-                    table_name,
-                    table_config.columns.len()
-                );
-                full_schema.insert(table_name, table_config);
-            }
+        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dat")) {
+            continue;
         }
-    }
-
-    let toml_string = toml::to_string_pretty(&full_schema)?;
-    fs::write(output_file, toml_string)?;
-    println!(
-        "\nPronto! Esquema mapeado com correção de gaps e salvo em {}.",
-        output_file
-    );
-    Ok(())
-}
-
-fn analyze_dat_file(path: &Path) -> std::io::Result<TableConfig> {
-    let mut file = File::open(path)?;
-    let mut h_info = [0u8; 512];
-    file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut h_info)?;
-
-    let total_fields = u16::from_le_bytes(h_info[0x2F..0x31].try_into().unwrap()) as usize;
-    let record_size = u16::from_le_bytes(h_info[0x2D..0x2F].try_into().unwrap()) as u32;
-
-    let mut temp_columns = Vec::new();
-    let step = 768;
-    let mut fields_buffer = vec![0u8; total_fields * step];
-    file.seek(SeekFrom::Start(0x0200))?;
-    file.read_exact(&mut fields_buffer)?;
-
-    for i in 0..total_fields {
-        let block_start = i * step;
-        let block = &fields_buffer[block_start..block_start + step];
-        let name_len = block[2] as usize;
-
-        if name_len > 0 && name_len <= 64 {
-            let name = String::from_utf8_lossy(&block[3..3 + name_len])
-                .trim_matches(|c: char| c == '\0' || c.is_whitespace())
-                .to_string();
-
-            let type_id = block[0xA4];
-            let offset = u16::from_le_bytes(block[0xAC..0xAE].try_into().unwrap()) as u32;
-            let length = u16::from_le_bytes(block[0xA6..0xA8].try_into().unwrap()) as u32;
-
-            if type_id != 0 {
-                let type_desc = match type_id {
-                    1 | 9 | 10 => "S",
-                    5 | 6 | 0x2E => "I",
-                    7 | 8 | 13 => "F",
-                    2 => "D",
-                    4 | 11 => "I",
-                    3 | 12 => "S",
-                    _ => "S",
-                };
-
-                temp_columns.push(Column {
-                    name,
-                    field_type: type_desc.to_string(),
-                    offset,
-                    length,
-                    type_id,
-                });
-            }
-        }
-    }
-
-    temp_columns.sort_by_key(|c| c.offset);
-
-    let mut final_columns = Vec::new();
-    let count = temp_columns.clone().len();
-
-    for i in 0..count {
-        let mut col = temp_columns[i].clone();
-
-        if col.length == 0 {
-            let next_offset = if i + 1 < count {
-                temp_columns[i + 1].offset
-            } else {
-                record_size
-            };
-
-            let gap = next_offset - col.offset;
-
-            col.length = match col.type_id {
-                4 | 11 => {
-                    if gap <= 3 {
-                        1
-                    } else {
-                        4
+        match Table::open(path) {
+            Ok(t) if !t.fields.is_empty() => {
+                for f in &t.fields {
+                    if !f.kind.verified() {
+                        unverified.entry(f.type_id).or_default().push(format!("{}.{}", t.name, f.name));
                     }
                 }
-
-                6 | 0x2E => 4,
-                5 => 2,
-                2 => 4,
-                7 | 8 | 12 => 8,
-                _ => 1,
-            };
-        }
-
-        let max_available = record_size as i32 - (col.offset as i32 + 1);
-        if (col.length as i32) > max_available {
-            let new_len = if max_available > 0 { max_available as u32 } else { 0 };
-            col.length = new_len;
-        }
-        if col.length > 0 {
-            final_columns.push(col);
+                println!("Tabela: {} ({} colunas, {} registros)", t.name, t.fields.len(), t.slots());
+                schema.insert(
+                    t.name.clone(),
+                    TableConfig { record_size: t.record_size as u32, columns: t.fields.iter().map(column).collect() },
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                errors += 1;
+                eprintln!("ERRO: {}: {e}", path.display());
+            }
         }
     }
 
-    Ok(TableConfig {
-        record_size,
-        columns: final_columns,
-    })
+    fs::write("schema.toml", toml::to_string_pretty(&schema)?)?;
+    println!("\nPronto: {} tabelas em schema.toml ({errors} com erro).", schema.len());
+    if !unverified.is_empty() {
+        println!("AVISO: tipos ainda não conferidos em base real (mandar um exemplo para conferir):");
+        for (id, cols) in &unverified {
+            let shown: Vec<&String> = cols.iter().take(5).collect();
+            println!("  tipo {id}: {} colunas, ex.: {:?}", cols.len(), shown);
+        }
+    }
+    Ok(())
 }
